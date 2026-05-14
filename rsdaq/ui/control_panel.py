@@ -18,17 +18,32 @@ from rsdaq.config import (
 from rsdaq.daq.boards import BoardInfo, BoardKind
 
 
+# Names of the right-side tabs the user can toggle on/off.
+TAB_KEYS = ("acquire", "spectrum", "captures", "thermocouples", "outputs", "vibration")
+TAB_DISPLAY = {
+    "acquire": "Acquire",
+    "spectrum": "Spectrum",
+    "captures": "Trigger captures",
+    "thermocouples": "Thermocouples",
+    "outputs": "Outputs",
+    "vibration": "Vibration (MCC172)",
+}
+
+
 class ControlPanel(QWidget):
     start_requested = Signal(AcquisitionConfig)
     stop_requested = Signal()
     boards_dialog_requested = Signal()
     calibration_dialog_requested = Signal()
+    display_dialog_requested = Signal()
+    tab_visibility_changed = Signal(str, bool)   # tab_key, visible
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mcc118_boards: List[BoardInfo] = []
         # board address -> list[QCheckBox] (length 8)
         self._channel_checks: Dict[int, List[QCheckBox]] = {}
+        self._tab_checks: Dict[str, QCheckBox] = {}
         self._build()
         self._wire()
 
@@ -42,6 +57,8 @@ class ControlPanel(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
+        # Horizontal scrollbar should never appear; vertical only as needed.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
 
         host = QWidget()
@@ -63,7 +80,26 @@ class ControlPanel(QWidget):
         row.addWidget(self.scan_btn)
         row.addWidget(self.cal_btn)
         bv.addLayout(row)
+        row2 = QHBoxLayout()
+        self.display_btn = QPushButton("Visualisation && units...")
+        row2.addWidget(self.display_btn)
+        row2.addStretch(1)
+        bv.addLayout(row2)
         root.addWidget(boards_group)
+
+        # ---- Visible tabs ----
+        tabs_group = QGroupBox("Visible tabs (right side)")
+        tabs_layout = QGridLayout(tabs_group)
+        tabs_layout.setHorizontalSpacing(14)
+        tabs_layout.setVerticalSpacing(4)
+        for i, key in enumerate(TAB_KEYS):
+            cb = QCheckBox(TAB_DISPLAY[key])
+            cb.setChecked(True)
+            cb.toggled.connect(
+                lambda checked, k=key: self.tab_visibility_changed.emit(k, checked))
+            self._tab_checks[key] = cb
+            tabs_layout.addWidget(cb, i // 2, i % 2)
+        root.addWidget(tabs_group)
 
         # ---- Channels (per-board grid, populated dynamically) ----
         self.channels_group = QGroupBox("MCC118 channels")
@@ -138,9 +174,6 @@ class ControlPanel(QWidget):
         # ---- FFT ----
         fft_group = QGroupBox("FFT view")
         fft_form = QFormLayout(fft_group)
-        self.fft_enable = QCheckBox("Show FFT tab")
-        self.fft_enable.setChecked(True)
-        fft_form.addRow("", self.fft_enable)
         self.fft_size = QComboBox()
         for s in (256, 512, 1024, 2048, 4096, 8192, 16384, 32768):
             self.fft_size.addItem(str(s), s)
@@ -190,6 +223,7 @@ class ControlPanel(QWidget):
     def _wire(self) -> None:
         self.scan_btn.clicked.connect(self.boards_dialog_requested.emit)
         self.cal_btn.clicked.connect(self.calibration_dialog_requested.emit)
+        self.display_btn.clicked.connect(self.display_dialog_requested.emit)
         self.rate_spin.valueChanged.connect(self._update_aggregate_label)
         self.scan_combo.currentTextChanged.connect(self._on_scan_mode_changed)
         self.record_check.toggled.connect(self._on_record_toggled)
@@ -201,6 +235,32 @@ class ControlPanel(QWidget):
         self._on_sw_enable_toggled(self.sw_enable.isChecked())
         self.set_running(False)
         self._update_aggregate_label()
+
+    # =======================================================================
+    # Public: tab visibility
+    # =======================================================================
+    def is_tab_visible(self, key: str) -> bool:
+        cb = self._tab_checks.get(key)
+        return bool(cb.isChecked()) if cb is not None else True
+
+    def set_tab_visible(self, key: str, visible: bool) -> None:
+        cb = self._tab_checks.get(key)
+        if cb is not None and cb.isChecked() != visible:
+            # Let the regular toggled signal fire so the main window
+            # rebuilds the tab bar to match. There's no feedback loop
+            # because the slot does not touch the checkbox.
+            cb.setChecked(visible)
+
+    def set_tab_available(self, key: str, available: bool) -> None:
+        """Enable/disable the checkbox (e.g. greyed out if no MCC134 detected)."""
+        cb = self._tab_checks.get(key)
+        if cb is None:
+            return
+        cb.setEnabled(available)
+        if not available:
+            cb.setToolTip("No matching board detected.")
+        else:
+            cb.setToolTip("")
 
     # =======================================================================
     # Public: set the list of MCC118 boards
@@ -331,7 +391,7 @@ class ControlPanel(QWidget):
             post_samples=int(self.sw_post.value()),
         )
         fft = FFTConfig(
-            enabled=self.fft_enable.isChecked(),
+            enabled=self.is_tab_visible("spectrum"),
             size=int(self.fft_size.currentData()),
             window=FFTWindow(self.fft_window.currentData()),
         )
@@ -359,10 +419,10 @@ class ControlPanel(QWidget):
         for grp in (self.channels_group,):
             grp.setEnabled(not running)
         for w in (
-            self.scan_btn, self.cal_btn, self.rate_spin, self.scan_combo,
-            self.samples_spin, self.trigger_combo, self.window_spin,
-            self.cal_check, self.record_check, self.sw_enable, self.fft_enable,
-            self.fft_size, self.fft_window,
+            self.scan_btn, self.cal_btn, self.display_btn,
+            self.rate_spin, self.scan_combo, self.samples_spin,
+            self.trigger_combo, self.window_spin, self.cal_check,
+            self.record_check, self.sw_enable, self.fft_size, self.fft_window,
         ):
             w.setEnabled(not running)
         rec = self.record_check.isChecked() and not running

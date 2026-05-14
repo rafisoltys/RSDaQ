@@ -1,14 +1,28 @@
-"""Real-time scrolling plot built on pyqtgraph."""
+"""Real-time visualisation: scrolling graph + side strip with bar/gauge widgets.
+
+Each (board, channel) is shown according to its ``ChannelDisplay.viz_style``:
+    GRAPH -> a curve on the scrolling pyqtgraph plot
+    BAR   -> a vertical bar widget on the right-side strip
+    GAUGE -> a radial gauge widget on the right-side strip
+
+Channel values can also be expressed in engineering units (e.g. bar) when the
+display config has ``use_eu=True``.
+"""
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFrame, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget,
+)
 
 from rsdaq.core.ringbuffer import RingBuffer
+from rsdaq.display import ChannelDisplay, DisplayStore, VizStyle
+from .gauge_widget import BarWidget, GaugeWidget
 
 # 8 high-contrast colours (one per channel index 0..7).
 CHANNEL_COLORS = [
@@ -18,12 +32,16 @@ CHANNEL_COLORS = [
 
 
 class PlotPanel(QWidget):
+    """Top-level acquire-tab visualisation widget."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         pg.setConfigOptions(antialias=True, useOpenGL=False)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
 
+        # Left: scrolling line plot
         self._plot = pg.PlotWidget(background="#15171c")
         self._plot.setLabel("left", "Voltage", units="V",
                            **{"color": "#c8cdd9", "font-size": "11pt"})
@@ -35,9 +53,27 @@ class PlotPanel(QWidget):
         self._plot.getAxis("bottom").setPen(pg.mkPen("#3a3f50"))
         self._plot.getAxis("left").setTextPen(pg.mkPen("#c8cdd9"))
         self._plot.getAxis("bottom").setTextPen(pg.mkPen("#c8cdd9"))
-        layout.addWidget(self._plot)
+        outer.addWidget(self._plot, 4)
 
-        self._curves: List[pg.PlotDataItem] = []
+        # Right: scrolling strip of bar/gauge widgets (created on demand)
+        self._side_scroll = QScrollArea()
+        self._side_scroll.setWidgetResizable(True)
+        self._side_scroll.setFrameShape(QFrame.NoFrame)
+        self._side_host = QWidget()
+        self._side_layout = QVBoxLayout(self._side_host)
+        self._side_layout.setContentsMargins(4, 4, 4, 4)
+        self._side_layout.setSpacing(8)
+        self._side_layout.addStretch(1)
+        self._side_scroll.setWidget(self._side_host)
+        self._side_scroll.setMinimumWidth(180)
+        self._side_scroll.setMaximumWidth(360)
+        self._side_scroll.hide()    # only shown if at least one bar/gauge channel exists
+        outer.addWidget(self._side_scroll, 1)
+
+        # State
+        self._curves: List[Optional[pg.PlotDataItem]] = []
+        self._side_widgets: List[Optional[object]] = []  # BarWidget | GaugeWidget | None
+        self._displays: List[ChannelDisplay] = []
         self._labels: List[str] = []
         self._channel_order: List[Tuple[int, int]] = []
         self._sample_rate: float = 1.0
@@ -45,21 +81,82 @@ class PlotPanel(QWidget):
         self._trigger_line: Optional[pg.InfiniteLine] = None
         self._trigger_level: Optional[pg.InfiniteLine] = None
 
-    def configure(self, channel_order: List[Tuple[int, int]], labels: List[str],
-                  sample_rate_hz: float, buffer: RingBuffer,
-                  trigger_level_v: Optional[float] = None) -> None:
+    # ------------------------------------------------------- public API
+    def configure(
+        self,
+        channel_order: List[Tuple[int, int]],
+        labels: List[str],
+        sample_rate_hz: float,
+        buffer: RingBuffer,
+        display_store: Optional[DisplayStore] = None,
+        trigger_level_v: Optional[float] = None,
+    ) -> None:
+        # ---------- reset graph ----------
         self._plot.clear()
-        self._curves = []
+        self._curves = [None] * len(labels)
         self._labels = list(labels)
         self._channel_order = list(channel_order)
         self._sample_rate = float(sample_rate_hz)
         self._buffer = buffer
-        for i, lbl in enumerate(self._labels):
-            _addr, ch = self._channel_order[i] if i < len(self._channel_order) else (0, i)
+
+        # Resolve display config per column
+        if display_store is None:
+            from rsdaq.display import DisplayStore as _DS
+            display_store = _DS()
+        self._displays = [
+            display_store.get(addr, ch) for (addr, ch) in self._channel_order
+        ]
+
+        # ---------- clear side strip ----------
+        # Remove all but the trailing stretch.
+        while self._side_layout.count() > 1:
+            item = self._side_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._side_widgets = [None] * len(labels)
+
+        any_side = False
+        graph_units = []
+        # Build one curve per GRAPH channel and one widget per BAR/GAUGE channel.
+        for i, (lbl, disp) in enumerate(zip(self._labels, self._displays)):
+            _addr, ch = self._channel_order[i]
             color = QColor(CHANNEL_COLORS[ch % len(CHANNEL_COLORS)])
-            pen = pg.mkPen(color, width=1.6)
-            curve = self._plot.plot([], [], pen=pen, name=lbl)
-            self._curves.append(curve)
+            display_label = self._compose_label(lbl, disp)
+            if disp.viz_style is VizStyle.GRAPH:
+                pen = pg.mkPen(color, width=1.6)
+                curve = self._plot.plot([], [], pen=pen, name=display_label)
+                self._curves[i] = curve
+                graph_units.append(disp.display_unit)
+            elif disp.viz_style is VizStyle.BAR:
+                w = BarWidget()
+                w.set_title(display_label)
+                w.set_color(color)
+                w.set_unit(disp.display_unit)
+                w.set_range(disp.display_min, disp.display_max)
+                self._side_widgets[i] = w
+                self._side_layout.insertWidget(self._side_layout.count() - 1, w)
+                any_side = True
+            elif disp.viz_style is VizStyle.GAUGE:
+                w = GaugeWidget()
+                w.set_title(display_label)
+                w.set_color(color)
+                w.set_unit(disp.display_unit)
+                w.set_range(disp.display_min, disp.display_max)
+                self._side_widgets[i] = w
+                self._side_layout.insertWidget(self._side_layout.count() - 1, w)
+                any_side = True
+
+        # If all graph channels share a single unit, advertise it on the y axis.
+        unique_units = sorted(set(graph_units))
+        if len(unique_units) == 1:
+            self._plot.setLabel("left", "Value", units=unique_units[0],
+                                **{"color": "#c8cdd9", "font-size": "11pt"})
+        else:
+            self._plot.setLabel("left", "Value", units="",
+                                **{"color": "#c8cdd9", "font-size": "11pt"})
+
+        self._side_scroll.setVisible(any_side)
         self._trigger_line = None
         if trigger_level_v is not None:
             self._trigger_level = pg.InfiniteLine(
@@ -69,9 +166,21 @@ class PlotPanel(QWidget):
         else:
             self._trigger_level = None
 
+    # ------------------------------------------------------- helpers
+    @staticmethod
+    def _compose_label(label: str, disp: ChannelDisplay) -> str:
+        if disp.label:
+            return f"{label}  -  {disp.label}"
+        return label
+
+    # ------------------------------------------------------- public API
     def clear(self) -> None:
         for c in self._curves:
-            c.setData([], [])
+            if c is not None:
+                c.setData([], [])
+        for w in self._side_widgets:
+            if w is not None:
+                w.set_value(0.0)
 
     def mark_trigger(self, t_seconds: float) -> None:
         if self._trigger_line is not None:
@@ -82,7 +191,7 @@ class PlotPanel(QWidget):
         self._plot.addItem(self._trigger_line)
 
     def refresh(self) -> None:
-        if self._buffer is None or not self._curves:
+        if self._buffer is None:
             return
         data, total = self._buffer.snapshot()
         n = data.shape[0]
@@ -91,6 +200,16 @@ class PlotPanel(QWidget):
         t_end = total / self._sample_rate
         t_start = t_end - n / self._sample_rate
         x = np.linspace(t_start, t_end, n, endpoint=False)
-        for i, curve in enumerate(self._curves):
-            if i < data.shape[1]:
-                curve.setData(x, data[:, i])
+        for i, disp in enumerate(self._displays):
+            if i >= data.shape[1]:
+                continue
+            col = data[:, i]
+            curve = self._curves[i]
+            if curve is not None:
+                # Apply EU mapping in-place if requested.
+                y = disp.to_display(col)
+                curve.setData(x, y)
+            side = self._side_widgets[i]
+            if side is not None:
+                last = float(disp.scalar_to_display(float(col[-1])))
+                side.set_value(last)
