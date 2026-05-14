@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from importlib import resources
 
@@ -10,7 +11,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette, QColor
 from PySide6.QtWidgets import QApplication
 
-from rsdaq.daq import create_backend
 from rsdaq.ui.main_window import MainWindow
 
 
@@ -39,17 +39,23 @@ def _load_stylesheet() -> str:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="rsdaq", description="MCC118 data acquisition")
+    parser = argparse.ArgumentParser(prog="rsdaq",
+                                     description="MCC HAT data acquisition")
     parser.add_argument(
-        "--backend", choices=["auto", "mcc118", "simulator"], default="auto",
-        help="Force a specific DAQ backend (default: auto-detect)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
+        "--backend", choices=["auto", "real", "simulator"], default="auto",
+        help="Force real (daqhats) or simulated backends (default: auto-detect)")
+    parser.add_argument(
+        "--simulate", default=None,
+        help="Simulated topology, e.g. '0:118,1:134,2:152'. Sets RSDAQ_SIMULATE.")
+    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    if args.simulate is not None:
+        os.environ["RSDAQ_SIMULATE"] = args.simulate
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
@@ -62,8 +68,7 @@ def main(argv=None) -> int:
     if qss:
         app.setStyleSheet(qss)
 
-    backend = create_backend(args.backend)
-    win = MainWindow(backend=backend)
+    win = MainWindow(prefer_backend=args.backend)
     win.show()
     return app.exec()
 

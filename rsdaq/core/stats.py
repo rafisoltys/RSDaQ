@@ -1,14 +1,16 @@
 """Per-channel running statistics computed incrementally."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import numpy as np
 
 
 @dataclass
 class ChannelStats:
+    label: str = ""
     count: int = 0
     last: float = 0.0
     minimum: float = math.inf
@@ -34,10 +36,14 @@ class ChannelStats:
 
 
 class StatsTracker:
-    """Holds one ChannelStats per enabled channel."""
+    """Holds one ChannelStats per enabled channel column."""
 
-    def __init__(self, n_channels: int):
-        self.stats = [ChannelStats() for _ in range(n_channels)]
+    def __init__(self, n_channels: int, labels: Optional[List[str]] = None):
+        labels = labels or [""] * n_channels
+        self.stats: List[ChannelStats] = [
+            ChannelStats(label=labels[i] if i < len(labels) else "")
+            for i in range(n_channels)
+        ]
 
     def reset(self) -> None:
         for s in self.stats:
@@ -46,6 +52,9 @@ class StatsTracker:
     def update(self, samples: np.ndarray) -> None:
         if samples.size == 0:
             return
+        if samples.shape[1] != len(self.stats):
+            raise ValueError(
+                f"stats expects {len(self.stats)} columns, got {samples.shape[1]}")
         for i, s in enumerate(self.stats):
             col = samples[:, i]
             s.count += col.size

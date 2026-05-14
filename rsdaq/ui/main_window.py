@@ -2,23 +2,35 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import List, Optional
 
+import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QMainWindow, QMessageBox, QSplitter, QStatusBar,
-    QVBoxLayout, QWidget,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
-from rsdaq.config import AcquisitionConfig
+from rsdaq.calibration import CalibrationStore
+from rsdaq.config import AcquisitionConfig, TriggerRunMode
 from rsdaq.core.worker import AcquisitionWorker, make_worker_thread
-from rsdaq.daq import create_backend
-from rsdaq.daq.backend import DaqBackend
+from rsdaq.daq import (
+    create_output_backend, create_scan_backend, create_thermocouple_backend,
+    create_vibration_backend, scan_boards,
+)
+from rsdaq.daq.backend import ScanBackend
+from rsdaq.daq.boards import BoardInfo, BoardKind
 
+from .boards_dialog import BoardsDialog
+from .calibration_dialog import CalibrationDialog
 from .control_panel import ControlPanel
+from .fft_panel import FFTPanel
+from .output_panel import OutputPanel
 from .plot_panel import PlotPanel
 from .stats_panel import StatsPanel
+from .tc_panel import ThermocouplePanel
+from .vibration_panel import VibrationPanel
 
 log = logging.getLogger(__name__)
 
@@ -26,14 +38,18 @@ REFRESH_INTERVAL_MS = 50  # 20 Hz GUI refresh
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, backend: Optional[DaqBackend] = None):
+    def __init__(self, prefer_backend: str = "auto"):
         super().__init__()
-        self.setWindowTitle("RSDaQ - MCC118 Data Acquisition")
-        self.resize(1280, 760)
+        self.setWindowTitle("RSDaQ - MCC HAT Data Acquisition")
+        self.resize(1380, 820)
 
-        self._backend: DaqBackend = backend or create_backend("auto")
+        self._prefer = prefer_backend
+        self._boards: List[BoardInfo] = []
+        self._scan_backend: Optional[ScanBackend] = None
         self._worker: Optional[AcquisitionWorker] = None
         self._thread = None
+        self._calibration = CalibrationStore.load()
+        self._captures: List[np.ndarray] = []  # software-trigger captures
 
         self._build_ui()
         self._build_menu()
@@ -43,76 +59,207 @@ class MainWindow(QMainWindow):
         self._refresh_timer.setInterval(REFRESH_INTERVAL_MS)
         self._refresh_timer.timeout.connect(self._on_refresh)
 
-        self._set_status_idle()
+        # Initial board scan
+        self._do_scan_boards(initial=True)
 
-    # ------------------------------------------------------------------- UI
+    # =================================================================== UI
     def _build_ui(self) -> None:
         central = QWidget()
         outer = QHBoxLayout(central)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
 
         self.control_panel = ControlPanel()
-        self.control_panel.setFixedWidth(320)
+        self.control_panel.setFixedWidth(360)
         self.control_panel.start_requested.connect(self._on_start)
         self.control_panel.stop_requested.connect(self._on_stop)
+        self.control_panel.boards_dialog_requested.connect(self._open_boards_dialog)
+        self.control_panel.calibration_dialog_requested.connect(self._open_calibration_dialog)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(8, 8, 8, 8)
-        right_layout.setSpacing(8)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self._build_acquire_tab()
+
+        self.fft_panel = FFTPanel()
+        self.tabs.addTab(self.fft_panel, "Spectrum")
+
+        # TC and output tabs are populated after a scan
+        self._tc_tab_index: Optional[int] = None
+        self._out_tab_index: Optional[int] = None
+        self._vib_tab_index: Optional[int] = None
+        self._build_captures_tab()
+
+        outer.addWidget(self.control_panel)
+        outer.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+
+    def _build_acquire_tab(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8); layout.setSpacing(8)
 
         self.plot_panel = PlotPanel()
         self.stats_panel = StatsPanel()
         self.stats_panel.setMaximumHeight(220)
-
         splitter = QSplitter(Qt.Vertical)
         splitter.addWidget(self.plot_panel)
         splitter.addWidget(self.stats_panel)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
-        right_layout.addWidget(splitter)
+        layout.addWidget(splitter)
+        self.tabs.addTab(page, "Acquire")
 
-        outer.addWidget(self.control_panel)
-        outer.addWidget(right, 1)
-        self.setCentralWidget(central)
+    def _build_captures_tab(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        self._captures_label = QLabel("Software-trigger captures will appear here.")
+        self._captures_label.setProperty("role", "muted")
+        layout.addWidget(self._captures_label)
+        self._captures_plot = PlotPanel()
+        layout.addWidget(self._captures_plot, 1)
+        self.tabs.addTab(page, "Trigger captures")
+
+    def _rebuild_function_tabs(self) -> None:
+        """Add or replace MCC134 / MCC152 / MCC172 tabs based on detected boards."""
+        for idx in sorted(
+            [i for i in (self._tc_tab_index, self._out_tab_index, self._vib_tab_index)
+             if i is not None],
+            reverse=True
+        ):
+            self.tabs.removeTab(idx)
+        self._tc_tab_index = None
+        self._out_tab_index = None
+        self._vib_tab_index = None
+
+        tc_boards = [b for b in self._boards if b.kind is BoardKind.MCC134]
+        if tc_boards:
+            tc_host = QWidget(); v = QVBoxLayout(tc_host)
+            v.setContentsMargins(0, 0, 0, 0)
+            for b in tc_boards:
+                v.addWidget(ThermocouplePanel(create_thermocouple_backend(self._prefer), b.address))
+            self._tc_tab_index = self.tabs.addTab(tc_host, "Thermocouples")
+
+        out_boards = [b for b in self._boards if b.kind is BoardKind.MCC152]
+        if out_boards:
+            out_host = QWidget(); v = QVBoxLayout(out_host)
+            v.setContentsMargins(0, 0, 0, 0)
+            for b in out_boards:
+                v.addWidget(OutputPanel(create_output_backend(self._prefer), b.address))
+            self._out_tab_index = self.tabs.addTab(out_host, "Outputs")
+
+        vib_boards = [b for b in self._boards if b.kind is BoardKind.MCC172]
+        if vib_boards:
+            vib_host = QWidget(); v = QVBoxLayout(vib_host)
+            v.setContentsMargins(0, 0, 0, 0)
+            for b in vib_boards:
+                # Each MCC172 panel manages its own backend instance.
+                back = create_vibration_backend(addresses=[b.address], prefer=self._prefer)
+                v.addWidget(VibrationPanel(back, b.address))
+            self._vib_tab_index = self.tabs.addTab(vib_host, "Vibration (MCC172)")
 
     def _build_menu(self) -> None:
         bar = self.menuBar()
         file_menu = bar.addMenu("&File")
-        quit_act = QAction("&Quit", self, shortcut=QKeySequence.Quit, triggered=self.close)
-        file_menu.addAction(quit_act)
+        file_menu.addAction(QAction("&Quit", self,
+                                    shortcut=QKeySequence.Quit, triggered=self.close))
+
+        boards_menu = bar.addMenu("&Boards")
+        boards_menu.addAction(QAction("Scan && configure...", self,
+                                      triggered=self._open_boards_dialog))
+        boards_menu.addAction(QAction("Calibration...", self,
+                                      triggered=self._open_calibration_dialog))
 
         help_menu = bar.addMenu("&Help")
-        about_act = QAction("&About RSDaQ", self, triggered=self._show_about)
-        help_menu.addAction(about_act)
+        help_menu.addAction(QAction("&About RSDaQ", self,
+                                    triggered=self._show_about))
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar(self)
         self.setStatusBar(bar)
         self.status_state = QLabel("Idle")
-        self.status_board = QLabel(self._backend.board_info)
-        self.status_board.setProperty("role", "muted")
+        self.status_board = QLabel("")
         self.status_progress = QLabel("")
         bar.addWidget(self.status_state, 0)
         bar.addPermanentWidget(self.status_progress, 1)
         bar.addPermanentWidget(self.status_board, 0)
 
-    # -------------------------------------------------------------- handlers
-    def _on_start(self, cfg: AcquisitionConfig) -> None:
-        log.info("Starting acquisition: %s", cfg)
-        self._worker = AcquisitionWorker(self._backend)
-        self._worker.configure(cfg)
+    # ============================================================= board mgmt
+    def _do_scan_boards(self, initial: bool = False) -> None:
+        self._boards = scan_boards()
+        self._apply_boards()
+        if initial and not self._boards:
+            self.statusBar().showMessage("No boards detected; running in simulator mode.", 5000)
 
-        # Wire UI panels to the freshly created buffer/stats objects.
+    def _apply_boards(self) -> None:
+        mcc118 = [b for b in self._boards if b.kind is BoardKind.MCC118]
+        self.control_panel.set_mcc118_boards(mcc118)
+        self.control_panel.update_boards_summary(self._boards)
+        self.status_board.setText(self._boards_status_text())
+        # Build / re-build the scan backend to match selected MCC118 addresses.
+        if mcc118:
+            try:
+                self._scan_backend = create_scan_backend(
+                    addresses=[b.address for b in mcc118], prefer=self._prefer)
+            except Exception as exc:
+                log.warning("Could not create scan backend: %s", exc)
+                self._scan_backend = create_scan_backend(prefer="simulator")
+        else:
+            self._scan_backend = None
+        self._rebuild_function_tabs()
+
+    def _boards_status_text(self) -> str:
+        if not self._boards:
+            return "No boards"
+        parts = []
+        for b in self._boards:
+            parts.append(f"#{b.address}:{b.kind.value}{'*' if b.simulated else ''}")
+        return "  ".join(parts)
+
+    def _open_boards_dialog(self) -> None:
+        dlg = BoardsDialog(current=self._boards, parent=self)
+        if dlg.exec():
+            self._boards = dlg.selected_boards()
+            self._apply_boards()
+
+    def _open_calibration_dialog(self) -> None:
+        mcc118 = [b for b in self._boards if b.kind is BoardKind.MCC118]
+        if not mcc118:
+            QMessageBox.information(self, "Calibration",
+                                    "No MCC118 boards configured.")
+            return
+        dlg = CalibrationDialog(self._calibration, mcc118, parent=self)
+        dlg.exec()
+
+    # ================================================================= start
+    def _on_start(self, cfg: AcquisitionConfig) -> None:
+        if self._scan_backend is None:
+            QMessageBox.warning(self, "No board", "No MCC118 board configured.")
+            self.control_panel.set_running(False)
+            return
+        log.info("Starting acquisition: %s", cfg)
+        self._captures.clear()
+        self._captures_label.setText("Software-trigger captures will appear here.")
+        self._captures_plot.clear()
+
+        self._worker = AcquisitionWorker(self._scan_backend, calibration=self._calibration)
+        self._worker.configure(cfg)
         assert self._worker.buffer is not None and self._worker.stats is not None
-        self.plot_panel.configure(cfg.enabled_channels, cfg.sample_rate_hz, self._worker.buffer)
-        self.stats_panel.configure(cfg.enabled_channels, self._worker.stats)
+
+        order = self._worker.channel_order
+        labels = self._worker.labels
+        sw = cfg.software_trigger
+        trig_level = sw.level_v if sw.enabled else None
+        self.plot_panel.configure(order, labels, cfg.sample_rate_hz,
+                                  self._worker.buffer, trigger_level_v=trig_level)
+        self.stats_panel.configure(order, labels, self._worker.stats)
+        self.fft_panel.configure(order, labels, cfg.sample_rate_hz, self._worker.buffer)
+        self._captures_plot.configure(order, labels, cfg.sample_rate_hz, self._worker.buffer)
 
         self._worker.started_ok.connect(self._on_worker_started)
         self._worker.stopped.connect(self._on_worker_stopped)
         self._worker.error.connect(self._on_worker_error)
         self._worker.progress.connect(self._on_progress)
+        self._worker.triggered.connect(self._on_trigger_event)
 
         self._thread = make_worker_thread(self._worker)
         self._thread.finished.connect(self._on_thread_finished)
@@ -125,13 +272,14 @@ class MainWindow(QMainWindow):
             self._worker.request_stop()
             self.status_state.setText("Stopping...")
 
+    # ============================================================ worker hooks
     def _on_worker_started(self) -> None:
         self._refresh_timer.start()
         self.status_state.setText("Acquiring")
 
     def _on_worker_stopped(self, reason: str) -> None:
         self._refresh_timer.stop()
-        self._on_refresh()  # final paint
+        self._on_refresh()
         self.control_panel.set_running(False)
         self.status_state.setText(f"Idle ({reason})")
 
@@ -143,36 +291,49 @@ class MainWindow(QMainWindow):
 
     def _on_thread_finished(self) -> None:
         if self._worker is not None:
-            self._worker.deleteLater()
-            self._worker = None
+            self._worker.deleteLater(); self._worker = None
         if self._thread is not None:
-            self._thread.deleteLater()
-            self._thread = None
+            self._thread.deleteLater(); self._thread = None
 
     def _on_progress(self, total: int, elapsed: float) -> None:
         self.status_progress.setText(f"{total:,} samples  |  {elapsed:6.2f} s")
 
+    def _on_trigger_event(self, sample_index: int, waveform: np.ndarray) -> None:
+        self._captures.append(waveform)
+        self._captures_label.setText(
+            f"{len(self._captures)} capture(s); "
+            f"latest at sample #{sample_index:,}, length={waveform.shape[0]}")
+        # Mark the time on the live plot too.
+        if self._worker is not None and self._worker._cfg is not None:  # type: ignore[attr-defined]
+            self.plot_panel.mark_trigger(
+                sample_index / self._worker._cfg.sample_rate_hz)  # type: ignore[attr-defined]
+        # Flip to the captures tab on the very first event.
+        if len(self._captures) == 1:
+            self.tabs.setCurrentIndex(self.tabs.indexOf(self._captures_plot.parentWidget()))
+
     def _on_refresh(self) -> None:
         self.plot_panel.refresh()
         self.stats_panel.refresh()
+        if self.tabs.currentWidget() is self.fft_panel:
+            self.fft_panel.refresh()
 
-    def _set_status_idle(self) -> None:
-        self.status_state.setText("Idle")
-        self.status_progress.setText("")
-
+    # ============================================================== about/close
     def _show_about(self) -> None:
+        backends = ", ".join(b.kind.value for b in self._boards) or "no boards"
         QMessageBox.about(
             self, "About RSDaQ",
             "<h3>RSDaQ</h3>"
-            "<p>Data acquisition for the Digilent MCC118 HAT on Raspberry Pi 5.</p>"
-            f"<p>Backend: <b>{self._backend.board_info}</b></p>"
+            "<p>Data acquisition for Digilent MCC HATs on Raspberry Pi 5.</p>"
+            f"<p>Detected boards: <b>{backends}</b></p>"
+            "<p>Supports MCC118 (analog in), MCC134 (thermocouples), MCC152 (analog out + DIO).</p>"
         )
 
-    # --------------------------------------------------------------- closing
     def closeEvent(self, event) -> None:
         if self._worker is not None:
             self._worker.request_stop()
             if self._thread is not None:
-                self._thread.quit()
-                self._thread.wait(2000)
+                self._thread.quit(); self._thread.wait(2000)
+        # Stop any running vibration panels too.
+        for w in self.findChildren(VibrationPanel):
+            w.stop_and_close()
         super().closeEvent(event)
