@@ -139,8 +139,15 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(page, "Trigger captures")
 
     def _rebuild_function_tabs(self) -> None:
-        """Add or replace MCC134 / MCC152 / MCC172 tabs based on detected boards."""
-        # Remove old function tabs (they own their backend instances).
+        """Add or replace MCC134 / MCC152 / MCC172 tabs based on detected boards.
+
+        Function tabs are always inserted at fixed positions (after the three
+        always-on tabs), then individually hidden via setTabVisible() according
+        to the user's checkbox. We never call removeTab() to toggle visibility -
+        that caused Qt to keep stale labels around and made one tab's text bleed
+        onto a neighbour.
+        """
+        # Drop existing TC / Output / Vibration pages (they own their backends).
         for key in ("thermocouples", "outputs", "vibration"):
             page = self._tab_pages.pop(key, None)
             if page is not None:
@@ -193,39 +200,22 @@ class MainWindow(QMainWindow):
         self._reapply_tab_visibility()
 
     def _reapply_tab_visibility(self) -> None:
-        """Hide/show each tab according to its checkbox state."""
-        # We rebuild the tab order: only checked tabs are present.
-        # Snapshot the currently-displayed page so we can restore it.
-        current_page = self.tabs.currentWidget()
-        # Remove every tab without destroying the page widgets.
-        while self.tabs.count():
-            self.tabs.removeTab(0)
-        # Re-insert in the canonical order.
-        order = ("acquire", "spectrum", "captures",
-                 "thermocouples", "outputs", "vibration")
-        titles = {
-            "acquire": "Acquire", "spectrum": "Spectrum",
-            "captures": "Trigger captures", "thermocouples": "Thermocouples",
-            "outputs": "Outputs", "vibration": "Vibration (MCC172)",
-        }
-        for key in order:
-            page = self._tab_pages.get(key)
-            if page is None:
+        """Hide/show each tab using QTabWidget.setTabVisible() - no remove/add."""
+        for key, page in self._tab_pages.items():
+            idx = self.tabs.indexOf(page)
+            if idx < 0:
                 continue
-            if not self.control_panel.is_tab_visible(key):
-                page.hide()
-                continue
-            self.tabs.addTab(page, titles[key])
-            page.show()
-        # Try to restore the previously-active page; fall back to first.
-        if current_page is not None:
-            idx = self.tabs.indexOf(current_page)
-            if idx >= 0:
-                self.tabs.setCurrentIndex(idx)
+            visible = self.control_panel.is_tab_visible(key)
+            self.tabs.setTabVisible(idx, visible)
 
     def _on_tab_visibility_changed(self, key: str, visible: bool) -> None:
-        # Just reapply: simplest correct implementation.
-        self._reapply_tab_visibility()
+        page = self._tab_pages.get(key)
+        if page is None:
+            return
+        idx = self.tabs.indexOf(page)
+        if idx < 0:
+            return
+        self.tabs.setTabVisible(idx, visible)
 
     def _build_menu(self) -> None:
         bar = self.menuBar()

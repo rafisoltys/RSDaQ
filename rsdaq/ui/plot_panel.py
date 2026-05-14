@@ -6,7 +6,9 @@ Each (board, channel) is shown according to its ``ChannelDisplay.viz_style``:
     GAUGE -> a radial gauge widget on the right-side strip
 
 Channel values can also be expressed in engineering units (e.g. bar) when the
-display config has ``use_eu=True``.
+display config has ``use_eu=True``. Units are surfaced everywhere - axis label,
+legend, gauge/bar title - so the operator never has to wonder which channel
+carries which unit.
 """
 from __future__ import annotations
 
@@ -65,9 +67,15 @@ class PlotPanel(QWidget):
         self._side_layout.setSpacing(8)
         self._side_layout.addStretch(1)
         self._side_scroll.setWidget(self._side_host)
-        self._side_scroll.setMinimumWidth(180)
-        self._side_scroll.setMaximumWidth(360)
+        # Generous default width so a single gauge or bar reads well even when
+        # the scrolling line plot is also visible.
+        self._side_scroll.setMinimumWidth(220)
         self._side_scroll.hide()    # only shown if at least one bar/gauge channel exists
+
+        # Track which "stretch" each child widget gets in the outer layout so
+        # that when there are no graph channels the side strip takes the
+        # whole width and the bar/gauge widgets render at full size.
+        self._outer_layout = outer
         outer.addWidget(self._side_scroll, 1)
 
         # State
@@ -101,8 +109,7 @@ class PlotPanel(QWidget):
 
         # Resolve display config per column
         if display_store is None:
-            from rsdaq.display import DisplayStore as _DS
-            display_store = _DS()
+            display_store = DisplayStore()
         self._displays = [
             display_store.get(addr, ch) for (addr, ch) in self._channel_order
         ]
@@ -117,7 +124,8 @@ class PlotPanel(QWidget):
         self._side_widgets = [None] * len(labels)
 
         any_side = False
-        graph_units = []
+        any_graph = False
+        graph_units: List[str] = []
         # Build one curve per GRAPH channel and one widget per BAR/GAUGE channel.
         for i, (lbl, disp) in enumerate(zip(self._labels, self._displays)):
             _addr, ch = self._channel_order[i]
@@ -125,9 +133,13 @@ class PlotPanel(QWidget):
             display_label = self._compose_label(lbl, disp)
             if disp.viz_style is VizStyle.GRAPH:
                 pen = pg.mkPen(color, width=1.6)
-                curve = self._plot.plot([], [], pen=pen, name=display_label)
+                # Always include the unit in the legend so the user can read
+                # mixed-unit graphs without going back to the dialog.
+                legend_label = f"{display_label}  [{disp.display_unit}]"
+                curve = self._plot.plot([], [], pen=pen, name=legend_label)
                 self._curves[i] = curve
                 graph_units.append(disp.display_unit)
+                any_graph = True
             elif disp.viz_style is VizStyle.BAR:
                 w = BarWidget()
                 w.set_title(display_label)
@@ -147,18 +159,41 @@ class PlotPanel(QWidget):
                 self._side_layout.insertWidget(self._side_layout.count() - 1, w)
                 any_side = True
 
-        # If all graph channels share a single unit, advertise it on the y axis.
+        # Y-axis label: prefer a single-unit label; else say "(mixed)".
         unique_units = sorted(set(graph_units))
         if len(unique_units) == 1:
             self._plot.setLabel("left", "Value", units=unique_units[0],
                                 **{"color": "#c8cdd9", "font-size": "11pt"})
-        else:
-            self._plot.setLabel("left", "Value", units="",
+        elif len(unique_units) == 0:
+            # No graph channels - blank out the label, plot is hidden anyway.
+            self._plot.setLabel("left", "", units="",
                                 **{"color": "#c8cdd9", "font-size": "11pt"})
+        else:
+            self._plot.setLabel(
+                "left", "Value (mixed: " + ", ".join(unique_units) + ")",
+                units="",
+                **{"color": "#c8cdd9", "font-size": "11pt"})
 
+        # ---------- show / hide each side ----------
+        # If there are no graph channels, hide the line plot completely so the
+        # bar/gauge strip can use the full width of the page.
+        self._plot.setVisible(any_graph)
         self._side_scroll.setVisible(any_side)
+        # Adjust stretch factors so widgets get the space they deserve.
+        if any_graph and any_side:
+            self._outer_layout.setStretchFactor(self._plot, 4)
+            self._outer_layout.setStretchFactor(self._side_scroll, 2)
+            self._side_scroll.setMaximumWidth(420)
+        elif any_side:
+            self._outer_layout.setStretchFactor(self._side_scroll, 1)
+            # Allow the side strip to grow as wide as the page.
+            self._side_scroll.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+        elif any_graph:
+            self._outer_layout.setStretchFactor(self._plot, 1)
+
+        # Trigger marker housekeeping.
         self._trigger_line = None
-        if trigger_level_v is not None:
+        if trigger_level_v is not None and any_graph:
             self._trigger_level = pg.InfiniteLine(
                 pos=trigger_level_v, angle=0,
                 pen=pg.mkPen("#ff8a65", width=1, style=pg.QtCore.Qt.DashLine))
@@ -206,7 +241,7 @@ class PlotPanel(QWidget):
             col = data[:, i]
             curve = self._curves[i]
             if curve is not None:
-                # Apply EU mapping in-place if requested.
+                # Apply EU mapping if requested.
                 y = disp.to_display(col)
                 curve.setData(x, y)
             side = self._side_widgets[i]
