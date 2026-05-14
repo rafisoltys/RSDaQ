@@ -9,6 +9,10 @@ Channel values can also be expressed in engineering units (e.g. bar) when the
 display config has ``use_eu=True``. Units are surfaced everywhere - axis label,
 legend, gauge/bar title - so the operator never has to wonder which channel
 carries which unit.
+
+The vertical divider between the line plot and the right-hand strip is a
+QSplitter so the user can drag it with the mouse to give either side more
+space at runtime.
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QScrollArea, QSplitter, QVBoxLayout, QWidget,
 )
 
 from rsdaq.core.ringbuffer import RingBuffer
@@ -39,9 +43,18 @@ class PlotPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         pg.setConfigOptions(antialias=True, useOpenGL=False)
-        outer = QHBoxLayout(self)
+
+        # The PlotPanel hosts a horizontal QSplitter so the user can drag the
+        # boundary between the scrolling line plot and the bar/gauge strip.
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(8)
+        outer.setSpacing(0)
+
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.setObjectName("plotSplitter")
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.setHandleWidth(6)
+        outer.addWidget(self._splitter)
 
         # Left: scrolling line plot
         self._plot = pg.PlotWidget(background="#15171c")
@@ -55,7 +68,8 @@ class PlotPanel(QWidget):
         self._plot.getAxis("bottom").setPen(pg.mkPen("#3a3f50"))
         self._plot.getAxis("left").setTextPen(pg.mkPen("#c8cdd9"))
         self._plot.getAxis("bottom").setTextPen(pg.mkPen("#c8cdd9"))
-        outer.addWidget(self._plot, 4)
+        self._plot.setMinimumWidth(120)
+        self._splitter.addWidget(self._plot)
 
         # Right: scrolling strip of bar/gauge widgets (created on demand)
         self._side_scroll = QScrollArea()
@@ -67,16 +81,13 @@ class PlotPanel(QWidget):
         self._side_layout.setSpacing(8)
         self._side_layout.addStretch(1)
         self._side_scroll.setWidget(self._side_host)
-        # Generous default width so a single gauge or bar reads well even when
-        # the scrolling line plot is also visible.
-        self._side_scroll.setMinimumWidth(220)
+        self._side_scroll.setMinimumWidth(120)
+        self._splitter.addWidget(self._side_scroll)
         self._side_scroll.hide()    # only shown if at least one bar/gauge channel exists
 
-        # Track which "stretch" each child widget gets in the outer layout so
-        # that when there are no graph channels the side strip takes the
-        # whole width and the bar/gauge widgets render at full size.
-        self._outer_layout = outer
-        outer.addWidget(self._side_scroll, 1)
+        # Default: line plot dominates if both are present.
+        self._splitter.setStretchFactor(0, 4)
+        self._splitter.setStretchFactor(1, 2)
 
         # State
         self._curves: List[Optional[pg.PlotDataItem]] = []
@@ -176,20 +187,20 @@ class PlotPanel(QWidget):
 
         # ---------- show / hide each side ----------
         # If there are no graph channels, hide the line plot completely so the
-        # bar/gauge strip can use the full width of the page.
+        # bar/gauge strip can use the full width of the page. If there are no
+        # bar/gauge channels, hide the side strip. The QSplitter divider is
+        # only meaningful (and visible) when both halves are shown.
         self._plot.setVisible(any_graph)
         self._side_scroll.setVisible(any_side)
-        # Adjust stretch factors so widgets get the space they deserve.
         if any_graph and any_side:
-            self._outer_layout.setStretchFactor(self._plot, 4)
-            self._outer_layout.setStretchFactor(self._side_scroll, 2)
-            self._side_scroll.setMaximumWidth(420)
+            # Give the user a sensible starting split that they can drag.
+            total = max(800, self._splitter.width() or 0)
+            self._splitter.setSizes([int(total * 0.62), int(total * 0.38)])
         elif any_side:
-            self._outer_layout.setStretchFactor(self._side_scroll, 1)
-            # Allow the side strip to grow as wide as the page.
-            self._side_scroll.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+            # Side strip alone gets the full width.
+            self._splitter.setSizes([0, max(400, self._splitter.width() or 800)])
         elif any_graph:
-            self._outer_layout.setStretchFactor(self._plot, 1)
+            self._splitter.setSizes([max(400, self._splitter.width() or 800), 0])
 
         # Trigger marker housekeeping.
         self._trigger_line = None

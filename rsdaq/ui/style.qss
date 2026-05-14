@@ -97,3 +97,31 @@ QHeaderView::section {
     border: none;
     border-right: 1px solid #2f333f;
 }
+
+
+/* Splitter handles - draggable dividers between panels.
+   A subtle vertical/horizontal "grip" makes it obvious where the user can
+   click and drag to resize. The hover colour highlights it as interactive. */
+QSplitter::handle {
+    background-color: #2a2e3a;
+    border: none;
+}
+QSplitter::handle:horizontal {
+    width: 6px;
+    margin: 0 1px;
+    image: none;
+    border-left: 1px solid #1b1d23;
+    border-right: 1px solid #1b1d23;
+}
+QSplitter::handle:vertical {
+    height: 6px;
+    margin: 1px 0;
+    border-top: 1px solid #1b1d23;
+    border-bottom: 1px solid #1b1d23;
+}
+QSplitter::handle:hover {
+    background-color: #3a5fb6;
+}
+QSplitter::handle:pressed {
+    background-color: #5a8dee;
+}

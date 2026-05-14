@@ -5,7 +5,7 @@ import logging
 from typing import Dict, List, Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QMainWindow, QMessageBox, QSplitter, QStatusBar,
@@ -37,7 +37,9 @@ from .vibration_panel import VibrationPanel
 log = logging.getLogger(__name__)
 
 REFRESH_INTERVAL_MS = 50  # 20 Hz GUI refresh
-CONTROL_PANEL_WIDTH = 440  # wide enough that the inner scrollbar isn't needed
+CONTROL_PANEL_DEFAULT_WIDTH = 440  # initial width; user can drag it
+CONTROL_PANEL_MIN_WIDTH = 280
+CONTROL_PANEL_MAX_WIDTH = 720
 
 
 class MainWindow(QMainWindow):
@@ -67,17 +69,26 @@ class MainWindow(QMainWindow):
         self._refresh_timer.setInterval(REFRESH_INTERVAL_MS)
         self._refresh_timer.timeout.connect(self._on_refresh)
 
+        # Restore window + splitter layout from previous session, if any.
+        self._restore_layout()
+
         # Initial board scan
         self._do_scan_boards(initial=True)
 
     # =================================================================== UI
     def _build_ui(self) -> None:
-        central = QWidget()
-        outer = QHBoxLayout(central)
-        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        # The whole central area is a horizontal splitter so the user can
+        # drag the boundary between the control panel and the tab area with
+        # the mouse. The control panel is given a sensible min/max width so
+        # accidental drags don't make it unusable.
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setObjectName("mainSplitter")
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(6)
 
         self.control_panel = ControlPanel()
-        self.control_panel.setFixedWidth(CONTROL_PANEL_WIDTH)
+        self.control_panel.setMinimumWidth(CONTROL_PANEL_MIN_WIDTH)
+        self.control_panel.setMaximumWidth(CONTROL_PANEL_MAX_WIDTH)
         self.control_panel.start_requested.connect(self._on_start)
         self.control_panel.stop_requested.connect(self._on_stop)
         self.control_panel.boards_dialog_requested.connect(self._open_boards_dialog)
@@ -99,9 +110,14 @@ class MainWindow(QMainWindow):
         self._out_panels: List[OutputPanel] = []
         self._vib_panels: List[VibrationPanel] = []
 
-        outer.addWidget(self.control_panel)
-        outer.addWidget(self.tabs, 1)
-        self.setCentralWidget(central)
+        self.main_splitter.addWidget(self.control_panel)
+        self.main_splitter.addWidget(self.tabs)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        # Initial layout: control panel takes its default width, tabs fill the rest.
+        self.main_splitter.setSizes([CONTROL_PANEL_DEFAULT_WIDTH, 1000])
+
+        self.setCentralWidget(self.main_splitter)
 
     def _build_acquire_page(self) -> None:
         page = QWidget()
@@ -110,13 +126,20 @@ class MainWindow(QMainWindow):
 
         self.plot_panel = PlotPanel()
         self.stats_panel = StatsPanel()
-        self.stats_panel.setMaximumHeight(220)
-        splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.plot_panel)
-        splitter.addWidget(self.stats_panel)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter)
+        # Lower bound rather than a hard cap so the user can drag the
+        # divider to give the stats table more room when needed.
+        self.stats_panel.setMinimumHeight(80)
+        self.acquire_splitter = QSplitter(Qt.Vertical)
+        self.acquire_splitter.setObjectName("acquireSplitter")
+        self.acquire_splitter.setChildrenCollapsible(False)
+        self.acquire_splitter.setHandleWidth(6)
+        self.acquire_splitter.addWidget(self.plot_panel)
+        self.acquire_splitter.addWidget(self.stats_panel)
+        self.acquire_splitter.setStretchFactor(0, 4)
+        self.acquire_splitter.setStretchFactor(1, 1)
+        # Reasonable defaults; the user can drag from here.
+        self.acquire_splitter.setSizes([520, 180])
+        layout.addWidget(self.acquire_splitter)
 
         self._tab_pages["acquire"] = page
         self.tabs.addTab(page, "Acquire")
@@ -407,7 +430,38 @@ class MainWindow(QMainWindow):
             "<p>Supports MCC118, MCC134, MCC152 and MCC172.</p>"
         )
 
+    # =========================================================== layout state
+    def _restore_layout(self) -> None:
+        """Restore window geometry and splitter sizes from the previous run."""
+        try:
+            settings = QSettings("rafisoltys", "RSDaQ")
+            geom = settings.value("layout/geometry")
+            if geom is not None:
+                self.restoreGeometry(geom)
+            state = settings.value("layout/state")
+            if state is not None:
+                self.restoreState(state)
+            main_state = settings.value("layout/main_splitter")
+            if main_state is not None:
+                self.main_splitter.restoreState(main_state)
+            acq_state = settings.value("layout/acquire_splitter")
+            if acq_state is not None:
+                self.acquire_splitter.restoreState(acq_state)
+        except Exception as exc:
+            log.warning("Could not restore layout: %s", exc)
+
+    def _save_layout(self) -> None:
+        try:
+            settings = QSettings("rafisoltys", "RSDaQ")
+            settings.setValue("layout/geometry", self.saveGeometry())
+            settings.setValue("layout/state", self.saveState())
+            settings.setValue("layout/main_splitter", self.main_splitter.saveState())
+            settings.setValue("layout/acquire_splitter", self.acquire_splitter.saveState())
+        except Exception as exc:
+            log.warning("Could not save layout: %s", exc)
+
     def closeEvent(self, event) -> None:
+        self._save_layout()
         if self._worker is not None:
             self._worker.request_stop()
             if self._thread is not None:
