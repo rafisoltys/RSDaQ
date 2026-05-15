@@ -273,7 +273,15 @@ class MainWindow(QMainWindow):
         self._boards = scan_boards()
         self._apply_boards()
         if initial and not self._boards:
-            self.statusBar().showMessage("No boards detected; running in simulator mode.", 5000)
+            from rsdaq.daq.boards import _try_import_daqhats
+            if _try_import_daqhats() is not None:
+                # daqhats IS installed (we're on the Pi) but no boards found.
+                self.statusBar().showMessage(
+                    "WARNING: daqhats installed but NO boards detected! "
+                    "Check HAT seating and run 'daqhats_list_boards'.", 10000)
+            else:
+                self.statusBar().showMessage(
+                    "daqhats not installed; running in simulator mode.", 5000)
 
     def _apply_boards(self) -> None:
         mcc118 = [b for b in self._boards if b.kind is BoardKind.MCC118]
@@ -285,8 +293,12 @@ class MainWindow(QMainWindow):
                 self._scan_backend = create_scan_backend(
                     addresses=[b.address for b in mcc118], prefer=self._prefer)
             except Exception as exc:
-                log.warning("Could not create scan backend: %s", exc)
-                self._scan_backend = create_scan_backend(prefer="simulator")
+                log.error("Could not create MCC118 scan backend: %s", exc)
+                self._scan_backend = None
+                QMessageBox.warning(
+                    self, "Backend error",
+                    f"MCC118 backend failed to initialise:\n{exc}\n\n"
+                    "Check HAT connections and run 'daqhats_list_boards'.")
         else:
             self._scan_backend = None
         self._rebuild_function_tabs()

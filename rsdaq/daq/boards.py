@@ -68,15 +68,49 @@ def _try_import_daqhats():
         return None
 
 
-def _hat_kind_from_id(hat_ids_module, raw_id: int) -> BoardKind:
-    """Map a daqhats HatIDs enum value to our BoardKind."""
-    mapping = {
-        getattr(hat_ids_module, "MCC_118", None): BoardKind.MCC118,
-        getattr(hat_ids_module, "MCC_134", None): BoardKind.MCC134,
-        getattr(hat_ids_module, "MCC_152", None): BoardKind.MCC152,
-        getattr(hat_ids_module, "MCC_172", None): BoardKind.MCC172,
-    }
-    return mapping.get(raw_id, BoardKind.UNKNOWN)
+def _hat_kind_from_id(hat_ids_module, raw_id) -> BoardKind:
+    """Map a daqhats HatIDs enum value to our BoardKind.
+
+    The ``raw_id`` can be an int or an enum member. We compare both by value
+    and by identity to handle different daqhats versions and Python enum quirks.
+    """
+    # Build mapping from int value -> BoardKind.
+    mapping = {}
+    for attr, kind in (
+        ("MCC_118", BoardKind.MCC118),
+        ("MCC_134", BoardKind.MCC134),
+        ("MCC_152", BoardKind.MCC152),
+        ("MCC_172", BoardKind.MCC172),
+    ):
+        val = getattr(hat_ids_module, attr, None)
+        if val is not None:
+            # Store both the enum member itself and its int value as keys.
+            mapping[val] = kind
+            try:
+                mapping[int(val)] = kind
+            except (TypeError, ValueError):
+                pass
+
+    # Try direct lookup first (enum identity), then by int coercion.
+    result = mapping.get(raw_id)
+    if result is not None:
+        return result
+    try:
+        result = mapping.get(int(raw_id))
+    except (TypeError, ValueError):
+        pass
+    if result is not None:
+        return result
+
+    # Last resort: match by name substring in the repr (handles edge cases
+    # where the daqhats version exposes a different enum structure).
+    raw_str = str(raw_id).upper()
+    for substr, kind in (("118", BoardKind.MCC118), ("134", BoardKind.MCC134),
+                         ("152", BoardKind.MCC152), ("172", BoardKind.MCC172)):
+        if substr in raw_str:
+            return kind
+    log.warning("Unknown HAT ID %r; reporting as UNKNOWN.", raw_id)
+    return BoardKind.UNKNOWN
 
 
 def parse_simulated_topology(spec: str) -> List[BoardInfo]:
@@ -144,7 +178,9 @@ def scan_boards(simulate: Optional[str] = None) -> List[BoardInfo]:
     """Discover every connected HAT.
 
     ``simulate``:
-        - ``None`` — try real daqhats; if unavailable, fall back to default sim.
+        - ``None`` — try real daqhats; if unavailable AND we're not on a Pi,
+          fall back to simulator. If daqhats IS available but finds no boards,
+          return an empty list (no auto-simulate on real hardware).
         - ``""`` — force *empty* (no boards).
         - non-empty string — parsed as a simulated topology spec.
     """
@@ -153,18 +189,22 @@ def scan_boards(simulate: Optional[str] = None) -> List[BoardInfo]:
 
     daqhats = _try_import_daqhats()
     if daqhats is None:
+        # daqhats not installed — we're definitely not on a Pi with the HAT
+        # library. Only then do we fall back to a simulated topology so
+        # off-Pi development still works.
         return _default_simulated_topology()
 
+    # daqhats IS available — we're on the Pi (or user has it installed).
+    # Never auto-simulate; just report what the hardware scan finds.
     try:
         entries = daqhats.hat_list(filter_by_id=daqhats.HatIDs.ANY)
     except Exception as exc:
-        log.warning("hat_list failed (%s); using simulated topology.", exc)
-        return _default_simulated_topology()
+        log.error("hat_list() failed: %s. No boards will be available.", exc)
+        return []
 
     boards: List[BoardInfo] = []
     for e in entries:
         kind = _hat_kind_from_id(daqhats.HatIDs, e.id)
-        # The entry exposes .address, .id, .version, .product_name (varies by daqhats version)
         version = getattr(e, "version", "")
         boards.append(BoardInfo(
             address=int(e.address),
@@ -173,6 +213,11 @@ def scan_boards(simulate: Optional[str] = None) -> List[BoardInfo]:
             version=str(version) if version else "",
             simulated=False,
         ))
+    if not boards:
+        log.warning(
+            "daqhats is installed but hat_list() found 0 boards. "
+            "Check that the HAT is seated correctly and /etc/mcc/hats is populated. "
+            "Run 'daqhats_list_boards' from a terminal to diagnose.")
     return boards
 
 
